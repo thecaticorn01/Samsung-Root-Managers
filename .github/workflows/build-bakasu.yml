@@ -301,11 +301,15 @@ jobs:
             -a arm64-v8a -a armeabi-v7a -a x86_64 -a riscv64 \
             -K key.jks -A "$KEY_ALIAS" -P "$STOREPASS" -S "$STOREPASS" --strip
           VER="${{ needs.meta.outputs.driver_version }}"
+          SHORT="${{ needs.meta.outputs.upstream_short }}"
           mkdir -p out
-          i=0
           for apk in dist/*.apk; do
-            cp "$apk" "out/BakaSU-Samsung_${VER}-${{ needs.meta.outputs.upstream_short }}$([ $i -gt 0 ] && echo _$i).apk"
-            i=$((i+1))
+            # Name each APK by the ABI(s) its bundled libs carry, so the arm64-v8a
+            # phone build is obvious and splits don't collide on a numeric suffix.
+            abis=$(unzip -Z1 "$apk" 2>/dev/null | grep -oE '^lib/[^/]+' | sort -u | sed 's#lib/##')
+            n=$(echo "$abis" | grep -c .)
+            if [ "$n" -gt 1 ]; then tag=universal; elif [ "$n" -eq 1 ]; then tag="$abis"; else tag=noarch; fi
+            cp "$apk" "out/BakaSU-Samsung_${VER}-${SHORT}_${tag}.apk"
           done
           ls -la out
       - name: Upload manager APK
