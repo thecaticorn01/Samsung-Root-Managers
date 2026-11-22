@@ -42,19 +42,49 @@ jobs:
       - name: Mirror changed upstreams into upstream-* branches
         env:
           GH_TOKEN: ${{ github.token }}
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
         run: |
-          set -e
+          set -uo pipefail
+          # Best-effort mirror. The automatic GITHUB_TOKEN is forbidden from
+          # pushing commits that touch .github/workflows/** (GitHub's "workflows
+          # permission" rule), and upstream trees carry their own CI, so a plain
+          # mirror push is rejected. We therefore push a mirror with upstream's
+          # workflow files stripped; if even that is blocked we warn and carry on
+          # (the build/release path does not depend on these branches, and the
+          # exact upstream commit is recorded in state + release notes anyway).
+          # Set repo secret MIRROR_TOKEN (a PAT with `workflow` scope) to mirror
+          # upstream verbatim instead.
           mirror() { # repo branch our_branch sha changed
             [ "$5" = "true" ] || { echo "skip mirror $3 (unchanged)"; return 0; }
             echo "== mirroring $1@$2 -> $3 =="
             rm -rf up && git clone --single-branch --branch "$2" "https://github.com/$1" up
-            git -C up push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" \
-              "$4:refs/heads/$3"
+            local push_url
+            if [ -n "${MIRROR_TOKEN:-}" ]; then
+              push_url="https://x-access-token:${MIRROR_TOKEN}@github.com/${{ github.repository }}"
+              git -C up push -f "$push_url" "$4:refs/heads/$3" && { echo "mirrored verbatim"; return 0; }
+              echo "::warning::verbatim mirror push failed for $3"
+            fi
+            # Fallback: orphan single-commit snapshot of the upstream tree with
+            # .github/workflows removed (a new branch's whole history counts as
+            # "added", so workflow files must be absent from every commit, not
+            # just the tip). Token-pushable and still a faithful source snapshot.
+            push_url="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}"
+            git -C up checkout -q "$4"
+            rm -rf up/.github/workflows
+            git -C up checkout -q --orphan _mirror
+            git -C up add -A
+            git -C up -c user.name=bot -c user.email=bot@users.noreply.github.com \
+              commit -q -m "snapshot mirror of $1@$4 (CI workflows omitted — GITHUB_TOKEN cannot push workflow files; set MIRROR_TOKEN for a verbatim mirror)"
+            git -C up push -f "$push_url" "_mirror:refs/heads/$3" \
+              || echo "::warning::mirror of $3 skipped (push blocked); upstream commit still recorded in state"
           }
           mirror KernelSU-Next/KernelSU-Next dev  upstream-kernelsu-next \
-            "${{ steps.d.outputs.kernelsu_next_sha }}" "${{ steps.d.outputs.kernelsu_next_changed }}"
+            "${{ steps.d.outputs.kernelsu_next_sha }}" "${{ steps.d.outputs.kernelsu_next_changed }}" \
+            || echo "::warning::kernelsu-next mirror step errored; continuing"
           mirror Baka-SU/BakaSU main  upstream-bakasu \
-            "${{ steps.d.outputs.bakasu_sha }}" "${{ steps.d.outputs.bakasu_changed }}"
+            "${{ steps.d.outputs.bakasu_sha }}" "${{ steps.d.outputs.bakasu_changed }}" \
+            || echo "::warning::bakasu mirror step errored; continuing"
+          echo "mirror step done"
 
   # =========================================================================
   build-kernelsu-next:
