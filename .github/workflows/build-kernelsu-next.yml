@@ -344,9 +344,9 @@ jobs:
             echo "KEY_PASSWORD=$STOREPASS"
           } >> gradle.properties
           mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/x86_64 app/src/main/jniLibs/riscv64
-          cp ../../dl/ksun-ksud-aarch64-linux-android/*/release/ksud app/src/main/jniLibs/arm64-v8a/libksud.so
-          cp ../../dl/ksun-ksud-x86_64-linux-android/*/release/ksud app/src/main/jniLibs/x86_64/libksud.so
-          cp ../../dl/ksun-ksud-riscv64-linux-android/*/release/ksud app/src/main/jniLibs/riscv64/libksud.so
+          cp "$(find ../../dl/ksun-ksud-aarch64-linux-android -type f -name ksud | head -1)" app/src/main/jniLibs/arm64-v8a/libksud.so
+          cp "$(find ../../dl/ksun-ksud-x86_64-linux-android  -type f -name ksud | head -1)" app/src/main/jniLibs/x86_64/libksud.so
+          cp "$(find ../../dl/ksun-ksud-riscv64-linux-android -type f -name ksud | head -1)" app/src/main/jniLibs/riscv64/libksud.so
       - name: Build APK
         working-directory: src/manager
         run: ./gradlew clean assembleRelease
