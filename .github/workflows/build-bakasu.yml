@@ -1,0 +1,316 @@
+name: Build BakaSU (Samsung)
+
+# Reusable build for the BakaSU manager with Galaxy S26 Ultra (KDP/RKP/DEFEX
+# late-load) compatibility. Mirrors BakaSU's proven `build-manager.yml` pipeline
+# (DDK LKM + ksuinit + ksud + gradle + repack_apk_multi.py v2-only resign), but
+# re-materializes fresh upstream @ inputs.upstream_sha, re-applies this repo's
+# Samsung patch set, builds the RELEASE identity (com.resukisu.resukisu /
+# "BakaSU"), and signs with this backend's own certificate.
+#
+# Artifacts are prefixed `baka-` so the KernelSU-Next reusable build can run in
+# the same orchestrator run without a collision.
+
+on:
+  workflow_call:
+    inputs:
+      upstream_sha:
+        description: 'Upstream BakaSU commit to build'
+        required: true
+        type: string
+    outputs:
+      driver_version: { value: "${{ jobs.meta.outputs.driver_version }}" }
+      uapi_version:   { value: "${{ jobs.meta.outputs.uapi_version }}" }
+      version_name:   { value: "${{ jobs.meta.outputs.version_name }}" }
+      upstream_short: { value: "${{ jobs.meta.outputs.upstream_short }}" }
+      cert_size_hex:  { value: "${{ jobs.meta.outputs.cert_size_hex }}" }
+      cert_hash:      { value: "${{ jobs.meta.outputs.cert_hash }}" }
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'Upstream BakaSU commit to build (blank = main HEAD)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  UPSTREAM_REPO: Baka-SU/BakaSU
+  UPSTREAM_BRANCH: main
+  PATCH: patches/bakasu-samsung.patch
+  KEYSTORE: keystores/bakasu.jks
+  STOREPASS: samsung-bakasu
+  KEY_ALIAS: bakasu
+  KSUCLI: manager/app/src/main/java/org/bakasu/bakasu/data/shell/KsuCli.kt
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha:   ${{ steps.sha.outputs.sha }}
+      upstream_short: ${{ steps.p.outputs.upstream_short }}
+      driver_version: ${{ steps.p.outputs.driver_version }}
+      uapi_version:   ${{ steps.p.outputs.uapi_version }}
+      version_name:   ${{ steps.p.outputs.version_name }}
+      cert_size_hex:  ${{ steps.p.outputs.cert_size_hex }}
+      cert_hash:      ${{ steps.p.outputs.cert_hash }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve SHA
+        id: sha
+        run: |
+          SHA="${{ inputs.upstream_sha }}"
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote "https://github.com/$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | awk '{print $1}')
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Prepare source (metadata + cert)
+        id: p
+        run: |
+          tools/backend-refresh/prepare_source.sh \
+            --repo "$UPSTREAM_REPO" --sha "${{ steps.sha.outputs.sha }}" \
+            --patch "$PATCH" --keystore "$KEYSTORE" --storepass "$STOREPASS" --alias "$KEY_ALIAS" \
+            --driver-extra 700 --sed-cert "$KSUCLI" --out src
+
+  lkm:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi: [android12-5.10, android13-5.10, android13-5.15, android14-5.15, android14-6.1, android15-6.6, android16-6.12, android17-6.18]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260828
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+      - name: Materialize source
+        run: |
+          tools/backend-refresh/prepare_source.sh \
+            --repo "$UPSTREAM_REPO" --sha "${{ needs.meta.outputs.upstream_sha }}" \
+            --patch "$PATCH" --skip-signing --out src
+      - name: Build kernelsu.ko (aarch64, Samsung compat)
+        run: |
+          cd src/kernel
+          CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CC=clang make \
+            KSU_EXPECTED_SIZE=${{ needs.meta.outputs.cert_size_hex }} \
+            KSU_EXPECTED_HASH=${{ needs.meta.outputs.cert_hash }} \
+            CONFIG_KSU_SAMSUNG_KDP=y CONFIG_KSU_SAMSUNG_RKP=y CONFIG_KSU_SAMSUNG_DEFEX=y CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=y
+          OUT=/github/workspace/out/aarch64; mkdir -p "$OUT"
+          cp kernelsu.ko "$OUT/${{ matrix.kmi }}_kernelsu.ko"
+          llvm-strip -d "$OUT/${{ matrix.kmi }}_kernelsu.ko"
+      - name: Upload aarch64 ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: baka-aarch64-${{ matrix.kmi }}-lkm
+          path: /github/workspace/out/aarch64/${{ matrix.kmi }}_kernelsu.ko
+          if-no-files-found: error
+      - name: Build kernelsu.ko (x86_64)
+        run: |
+          cd src/kernel
+          make clean
+          mkdir -p /opt/ddk/kdir-x64
+          unset ARCH CROSS_COMPILE
+          export ARCH=x86_64
+          kmi=${{ matrix.kmi }}
+          pushd /opt/ddk/src/$kmi
+          export KDIR=/opt/ddk/kdir-x64/$kmi
+          MODPOST=scripts/mod/modpost.c
+          sed -i -E 's/^([[:space:]]*)check_exports\(mod\);/\1\/\/ check_exports(mod);/' "$MODPOST" || true
+          sed -i -E 's/^([[:space:]]*)s->module = exp->module;/\1\/\/ s->module = exp->module;/' "$MODPOST" || true
+          sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$MODPOST" || true
+          sed -i 's/__version_ext_names\\") =\\n/__version_ext_names\\") = \\"\\"\\n/' "$MODPOST" || true
+          make O=$KDIR gki_defconfig
+          scripts/config --file $KDIR/.config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+          if [ "$kmi" == "android16-6.12" ] || [ "$kmi" == "android17-6.18" ]; then
+            scripts/config --file $KDIR/.config -e CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
+          fi
+          make O=$KDIR modules_prepare
+          make O=$KDIR security/selinux/built-in.a
+          popd
+          MDIR=$(realpath .)
+          if [ "$kmi" == "android17-6.18" ]; then
+            make -C $KDIR M=$MDIR MO=$MDIR compile_commands.json modules CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y \
+              KSU_EXPECTED_SIZE=${{ needs.meta.outputs.cert_size_hex }} KSU_EXPECTED_HASH=${{ needs.meta.outputs.cert_hash }}
+          else
+            make -C $KDIR M=$MDIR src=$MDIR compile_commands.json modules CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y \
+              KSU_EXPECTED_SIZE=${{ needs.meta.outputs.cert_size_hex }} KSU_EXPECTED_HASH=${{ needs.meta.outputs.cert_hash }}
+          fi
+          OUT=/github/workspace/out/x86_64; mkdir -p "$OUT"
+          cp kernelsu.ko "$OUT/${{ matrix.kmi }}_kernelsu.ko"
+          llvm-strip -d "$OUT/${{ matrix.kmi }}_kernelsu.ko"
+      - name: Upload x86_64 ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: baka-x86_64-${{ matrix.kmi }}-lkm
+          path: /github/workspace/out/x86_64/${{ matrix.kmi }}_kernelsu.ko
+          if-no-files-found: error
+
+  ksuinit:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: aarch64, triple: aarch64-linux-android,     clang: aarch64-linux-android,   api: 26, rt: aarch64-android }
+          - { arch: armv7,   triple: armv7-linux-androideabi,   clang: armv7a-linux-androideabi, api: 26, rt: arm-android }
+          - { arch: x86_64,  triple: x86_64-linux-android,      clang: x86_64-linux-android,    api: 26, rt: x86_64-android }
+          - { arch: riscv64, triple: riscv64-linux-android,     clang: riscv64-linux-android,   api: 35, rt: riscv64-android }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Materialize source
+        run: |
+          tools/backend-refresh/prepare_source.sh \
+            --repo "$UPSTREAM_REPO" --sha "${{ needs.meta.outputs.upstream_sha }}" \
+            --patch "$PATCH" --skip-signing --out src
+      - name: Setup rustup
+        run: |
+          rustup update nightly
+          rustup default nightly
+          rustup target add ${{ matrix.triple }} || rustup component add rust-src
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with: { ndk-version: r29 }
+      - name: Build ksuinit (${{ matrix.arch }})
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cd src
+          source .github/scripts/setup-rust-build.sh ${{ matrix.clang }} ${{ matrix.api }} ${{ matrix.triple }} || \
+            source .github/scripts/setup-rust-build.sh ${{ matrix.clang }} ${{ matrix.api }}
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-${{ matrix.rt }}.a"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cd userspace/ksuinit
+          if [ "${{ matrix.arch }}" = "riscv64" ]; then
+            cargo +nightly build -Z build-std=std,panic_abort --package ksuinit --target=${{ matrix.triple }} --release --config ../../.github/riscv64-cargo.toml
+          else
+            cargo build --package ksuinit --target=${{ matrix.triple }} --release
+          fi
+      - name: Upload ksuinit (${{ matrix.arch }})
+        uses: actions/upload-artifact@v7
+        with:
+          name: baka-ksuinit-${{ matrix.arch }}
+          path: src/userspace/ksuinit/target/${{ matrix.triple }}/release/ksuinit
+          if-no-files-found: error
+
+  ksud:
+    needs: [meta, lkm, ksuinit]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-android, x86_64-linux-android, armv7-linux-androideabi, riscv64-linux-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Materialize source
+        run: |
+          tools/backend-refresh/prepare_source.sh \
+            --repo "$UPSTREAM_REPO" --sha "${{ needs.meta.outputs.upstream_sha }}" \
+            --patch "$PATCH" --skip-signing --out src
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with: { ndk-version: r29 }
+      - name: Download LKM + ksuinit
+        uses: actions/download-artifact@v7
+        with: { pattern: baka-*, path: dl }
+      - name: Stage LKMs + ksuinit
+        run: |
+          cd src
+          mkdir -p userspace/ksud/bin/aarch64 userspace/ksud/bin/x86_64 userspace/ksud/bin/riscv64 userspace/ksud/bin/arm
+          cp ../dl/baka-aarch64-android*-lkm/*_kernelsu.ko userspace/ksud/bin/aarch64/
+          cp ../dl/baka-x86_64-android*-lkm/*_kernelsu.ko userspace/ksud/bin/x86_64/
+          cp ../dl/baka-ksuinit-aarch64/ksuinit userspace/ksud/bin/aarch64/
+          cp ../dl/baka-ksuinit-x86_64/ksuinit  userspace/ksud/bin/x86_64/
+          cp ../dl/baka-ksuinit-riscv64/ksuinit userspace/ksud/bin/riscv64/
+          cp ../dl/baka-ksuinit-armv7/ksuinit   userspace/ksud/bin/arm/
+          chmod +x userspace/ksud/bin/*/ksuinit || true
+      - name: Setup Rust toolchain
+        if: ${{ matrix.target != 'riscv64-linux-android' }}
+        uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: nightly, targets: "${{ matrix.target }}", components: rust-src }
+      - name: Setup Rust (riscv64)
+        if: ${{ matrix.target == 'riscv64-linux-android' }}
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Setup cargo-ndk
+        if: ${{ matrix.target != 'riscv64-linux-android' }}
+        run: cargo install cargo-ndk --locked
+      - name: Assemble LKM bootstrap
+        run: |
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o src/userspace/ksud/.lkm_image_bootstrap.o \
+            src/userspace/ksud/src/lkm_image_bootstrap.S
+      - name: Build ksud (${{ matrix.target }})
+        run: |
+          cd src
+          if [ "${{ matrix.target }}" == "riscv64-linux-android" ]; then
+            source .github/scripts/setup-rust-build.sh riscv64-linux-android 35
+            cd userspace/ksud/
+            cargo +nightly build -Z build-std=std,panic_abort --target "$TRIPLE" --release --manifest-path ./Cargo.toml --config ../../.github/riscv64-cargo.toml
+          else
+            cd userspace/ksud/
+            cargo ndk b -P 26 -t ${{ matrix.target }} -r -Z build-std-features="optimize_for_size" -Z trim-paths
+          fi
+      - name: Upload ksud (${{ matrix.target }})
+        uses: actions/upload-artifact@v7
+        with:
+          name: baka-ksud-${{ matrix.target }}
+          path: src/userspace/ksud/target/**/release/ksud*
+          if-no-files-found: error
+
+  manager:
+    needs: [meta, ksud]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Materialize source (+ signing + cert swap)
+        run: |
+          tools/backend-refresh/prepare_source.sh \
+            --repo "$UPSTREAM_REPO" --sha "${{ needs.meta.outputs.upstream_sha }}" \
+            --patch "$PATCH" --keystore "$KEYSTORE" --storepass "$STOREPASS" --alias "$KEY_ALIAS" \
+            --driver-extra 700 --sed-cert "$KSUCLI" --out src
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: 21 }
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Write gradle signing config (release identity)
+        working-directory: src/manager
+        run: |
+          cp ../.signing/key.jks key.jks
+          {
+            echo "KEYSTORE_PASSWORD=$STOREPASS"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASSWORD=$STOREPASS"
+            echo "KEYSTORE_FILE=key.jks"
+          } >> gradle.properties
+      - name: Build APK (release identity)
+        working-directory: src/manager
+        run: ./gradlew assembleRelease -Pcommit=${{ needs.meta.outputs.upstream_sha }}
+      - name: Download ksud (all 4 targets)
+        uses: actions/download-artifact@v7
+        with: { pattern: baka-ksud-*, path: dl }
+      - name: Repack + v2-only resign (bundle ksud)
+        run: |
+          cd src
+          # ksud into the layout repack_apk_multi.py expects
+          for t in aarch64-linux-android x86_64-linux-android armv7-linux-androideabi riscv64-linux-android; do
+            mkdir -p target/$t/release
+            K=$(find ../dl/baka-ksud-$t -type f -name ksud | head -1)
+            cp -f "$K" target/$t/release/ksud
+          done
+          cp .signing/key.jks key.jks
+          python3 repack_apk_multi.py repack \
+            -b release -t release \
+            -a arm64-v8a -a armeabi-v7a -a x86_64 -a riscv64 \
+            -K key.jks -A "$KEY_ALIAS" -P "$STOREPASS" -S "$STOREPASS" --strip
+          VER="${{ needs.meta.outputs.driver_version }}"
+          mkdir -p out
+          i=0
+          for apk in dist/*.apk; do
+            cp "$apk" "out/BakaSU-Samsung_${VER}-${{ needs.meta.outputs.upstream_short }}$([ $i -gt 0 ] && echo _$i).apk"
+            i=$((i+1))
+          done
+          ls -la out
+      - name: Upload manager APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: baka-manager-apk
+          path: src/out/BakaSU-Samsung_*.apk
+          if-no-files-found: error

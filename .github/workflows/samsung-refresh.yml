@@ -1,0 +1,194 @@
+name: Samsung backend refresh
+
+# Daily: check upstream KernelSU-Next and BakaSU. For each backend that moved,
+# mirror upstream into upstream-<backend>, rebuild the Galaxy S26 Ultra manager
+# (+ ksud + .ko) with its own signing cert, and update that backend's rolling
+# release. If nothing moved, only the "last successful run" timestamp in each
+# release is refreshed. If only one moved, only that one's release is touched.
+
+on:
+  schedule:
+    - cron: '36 4 * * *'   # 04:36 UTC daily (off-peak, jittered minute)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force a rebuild regardless of upstream: "", "all", "kernelsu-next", or "bakasu"'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: samsung-refresh
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      kernelsu_next_changed: ${{ steps.d.outputs.kernelsu_next_changed }}
+      kernelsu_next_sha:     ${{ steps.d.outputs.kernelsu_next_sha }}
+      bakasu_changed:        ${{ steps.d.outputs.bakasu_changed }}
+      bakasu_sha:            ${{ steps.d.outputs.bakasu_sha }}
+      any_changed:           ${{ steps.d.outputs.any_changed }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Detect upstream changes
+        id: d
+        run: python3 tools/backend-refresh/detect_changes.py "force=${{ inputs.force }}"
+      - name: Mirror changed upstreams into upstream-* branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mirror() { # repo branch our_branch sha changed
+            [ "$5" = "true" ] || { echo "skip mirror $3 (unchanged)"; return 0; }
+            echo "== mirroring $1@$2 -> $3 =="
+            rm -rf up && git clone --single-branch --branch "$2" "https://github.com/$1" up
+            git -C up push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" \
+              "$4:refs/heads/$3"
+          }
+          mirror KernelSU-Next/KernelSU-Next dev  upstream-kernelsu-next \
+            "${{ steps.d.outputs.kernelsu_next_sha }}" "${{ steps.d.outputs.kernelsu_next_changed }}"
+          mirror Baka-SU/BakaSU main  upstream-bakasu \
+            "${{ steps.d.outputs.bakasu_sha }}" "${{ steps.d.outputs.bakasu_changed }}"
+
+  # =========================================================================
+  build-kernelsu-next:
+    needs: detect
+    if: needs.detect.outputs.kernelsu_next_changed == 'true'
+    uses: ./.github/workflows/build-kernelsu-next.yml
+    with:
+      upstream_sha: ${{ needs.detect.outputs.kernelsu_next_sha }}
+
+  build-bakasu:
+    needs: detect
+    if: needs.detect.outputs.bakasu_changed == 'true'
+    uses: ./.github/workflows/build-bakasu.yml
+    with:
+      upstream_sha: ${{ needs.detect.outputs.bakasu_sha }}
+
+  # =========================================================================
+  release-kernelsu-next:
+    needs: [detect, build-kernelsu-next]
+    if: needs.detect.outputs.kernelsu_next_changed == 'true' && needs.build-kernelsu-next.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: kernelsu-next-samsung
+      TITLE: KernelSU Next (Samsung)
+      STATE: state/kernelsu-next.json
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with: { pattern: ksun-*, path: dl }
+      - name: Collect release assets
+        run: |
+          tools/backend-refresh/collect_assets.sh ksun dl release-assets | tee assets.txt
+      - name: Update state + render notes
+        run: |
+          python3 tools/backend-refresh/update_state.py --state "$STATE" --mode rebuild \
+            --field last_built_sha=${{ needs.detect.outputs.kernelsu_next_sha }} \
+            --field last_built_short=${{ needs.build-kernelsu-next.outputs.upstream_short }} \
+            --field driver_version=${{ needs.build-kernelsu-next.outputs.driver_version }} \
+            --field uapi_version=${{ needs.build-kernelsu-next.outputs.uapi_version }} \
+            --field version_name=${{ needs.build-kernelsu-next.outputs.version_name }} \
+            --field manager_version_code=${{ needs.build-kernelsu-next.outputs.driver_version }} \
+            --field cert_size_hex=${{ needs.build-kernelsu-next.outputs.cert_size_hex }} \
+            --field cert_hash=${{ needs.build-kernelsu-next.outputs.cert_hash }} \
+            --assets-file assets.txt
+          python3 tools/backend-refresh/render_release_notes.py "$STATE" > notes.md
+      - name: Publish rolling release
+        run: tools/backend-refresh/publish_release.sh "$TAG" "$TITLE" release-assets notes.md
+      - uses: actions/upload-artifact@v7
+        with: { name: state-kernelsu-next, path: state/kernelsu-next.json }
+
+  release-bakasu:
+    needs: [detect, build-bakasu]
+    if: needs.detect.outputs.bakasu_changed == 'true' && needs.build-bakasu.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: bakasu-samsung
+      TITLE: BakaSU (Samsung)
+      STATE: state/bakasu.json
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with: { pattern: baka-*, path: dl }
+      - name: Collect release assets
+        run: |
+          tools/backend-refresh/collect_assets.sh baka dl release-assets | tee assets.txt
+      - name: Update state + render notes
+        run: |
+          python3 tools/backend-refresh/update_state.py --state "$STATE" --mode rebuild \
+            --field last_built_sha=${{ needs.detect.outputs.bakasu_sha }} \
+            --field last_built_short=${{ needs.build-bakasu.outputs.upstream_short }} \
+            --field driver_version=${{ needs.build-bakasu.outputs.driver_version }} \
+            --field uapi_version=${{ needs.build-bakasu.outputs.uapi_version }} \
+            --field version_name=${{ needs.build-bakasu.outputs.version_name }} \
+            --field manager_version_code=${{ needs.build-bakasu.outputs.driver_version }} \
+            --field cert_size_hex=${{ needs.build-bakasu.outputs.cert_size_hex }} \
+            --field cert_hash=${{ needs.build-bakasu.outputs.cert_hash }} \
+            --assets-file assets.txt
+          python3 tools/backend-refresh/render_release_notes.py "$STATE" > notes.md
+      - name: Publish rolling release
+        run: tools/backend-refresh/publish_release.sh "$TAG" "$TITLE" release-assets notes.md
+      - uses: actions/upload-artifact@v7
+        with: { name: state-bakasu, path: state/bakasu.json }
+
+  # =========================================================================
+  heartbeat:
+    needs: detect
+    if: needs.detect.outputs.any_changed == 'false'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Refresh "last successful run" timestamp in both releases
+        run: |
+          beat() { # tag state
+            python3 tools/backend-refresh/update_state.py --state "$2" --mode heartbeat
+            python3 tools/backend-refresh/render_release_notes.py "$2" > notes.md
+            if gh release view "$1" >/dev/null 2>&1; then
+              gh release edit "$1" --notes-file notes.md
+              echo "heartbeat: updated notes for $1"
+            else
+              echo "heartbeat: release $1 does not exist yet; nothing to update"
+            fi
+          }
+          beat kernelsu-next-samsung state/kernelsu-next.json
+          beat bakasu-samsung        state/bakasu.json
+      - uses: actions/upload-artifact@v7
+        with: { name: state-kernelsu-next, path: state/kernelsu-next.json }
+      - uses: actions/upload-artifact@v7
+        with: { name: state-bakasu, path: state/bakasu.json }
+
+  # =========================================================================
+  persist-state:
+    needs: [detect, release-kernelsu-next, release-bakasu, heartbeat]
+    if: always() && needs.detect.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        continue-on-error: true
+        with: { pattern: state-*, path: incoming, merge-multiple: true }
+      - name: Commit updated state (if any)
+        run: |
+          set -e
+          [ -d incoming ] || { echo "no state artifacts"; exit 0; }
+          cp -f incoming/*.json state/ 2>/dev/null || true
+          if git diff --quiet -- state; then
+            echo "no state changes to commit"
+            exit 0
+          fi
+          git config user.name  "samsung-root-managers-bot"
+          git config user.email "69053671+thecaticorn01@users.noreply.github.com"
+          git add state
+          git commit -m "chore(state): update rolling-release provenance [skip ci]"
+          git push

@@ -1,0 +1,12 @@
+# CI working directories (never committed; created on the runner)
+/src/
+/dl/
+/incoming/
+/release-assets/
+/out/
+up/
+notes.md
+assets.txt
+# transient cert exports
+keystores/*.der
+**/.signing/

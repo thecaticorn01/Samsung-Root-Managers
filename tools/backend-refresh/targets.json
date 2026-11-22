@@ -1,0 +1,41 @@
+{
+  "_comment": "Source of truth for the Samsung rolling-rebuild system. One entry per backend. The orchestrator (.github/workflows/samsung-refresh.yml) and the per-backend build workflows read this. Add a backend here, drop a matching patches/<id>-samsung.patch and keystores/<id>.jks, and wire a build-<id>.yml to extend the system.",
+  "backends": {
+    "kernelsu-next": {
+      "display_name": "KernelSU Next (Samsung)",
+      "release_tag": "kernelsu-next-samsung",
+      "upstream_repo": "KernelSU-Next/KernelSU-Next",
+      "upstream_branch": "dev",
+      "mirror_branch": "upstream-kernelsu-next",
+      "patch": "patches/kernelsu-next-samsung.patch",
+      "patch_base": "32e25d58fc1a187e1abe7278904c31571235fc83",
+      "keystore": "keystores/kernelsu-next.jks",
+      "keystore_password": "samsung-ksunext",
+      "key_alias": "ksunext",
+      "driver_version_formula": "30000 + git_commit_count",
+      "build_workflow": ".github/workflows/build-kernelsu-next.yml",
+      "cert_replace": []
+    },
+    "bakasu": {
+      "display_name": "BakaSU (Samsung)",
+      "release_tag": "bakasu-samsung",
+      "upstream_repo": "Baka-SU/BakaSU",
+      "upstream_branch": "main",
+      "mirror_branch": "upstream-bakasu",
+      "patch": "patches/bakasu-samsung.patch",
+      "patch_base": "7b65bde0710b5e7c6f755545cb15a4abd417f3a8",
+      "keystore": "keystores/bakasu.jks",
+      "keystore_password": "samsung-bakasu",
+      "key_alias": "bakasu",
+      "driver_version_formula": "30000 + git_commit_count + 700",
+      "build_workflow": ".github/workflows/build-bakasu.yml",
+      "cert_replace": [
+        {
+          "file": "manager/app/src/main/java/org/bakasu/bakasu/data/shell/KsuCli.kt",
+          "old": "size: 0x307, hash: 4fb9754b5d8721499b229a47a9a0f80a52f180a81fef8fcb474066840d13641c",
+          "new": "size: {CERT_SIZE_HEX}, hash: {CERT_HASH}"
+        }
+      ]
+    }
+  }
+}

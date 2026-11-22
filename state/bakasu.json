@@ -1,0 +1,17 @@
+{
+  "backend_id": "bakasu",
+  "display_name": "BakaSU (Samsung)",
+  "upstream_repo": "Baka-SU/BakaSU",
+  "upstream_branch": "main",
+  "last_built_sha": "",
+  "last_built_short": "",
+  "driver_version": "",
+  "uapi_version": "",
+  "version_name": "",
+  "manager_version_code": "",
+  "cert_size_hex": "0x351",
+  "cert_hash": "61e388dda40c78b8c1d3261be82edf67412c82fe9a39f0d9035685146b55ab57",
+  "release_updated_utc": "",
+  "last_run_utc": "",
+  "assets": []
+}
