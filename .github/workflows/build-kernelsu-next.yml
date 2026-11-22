@@ -356,11 +356,17 @@ jobs:
           set -e
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
           BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
+          # Sign v2-ONLY and strip any v1 (JAR) signature. KSU-Next's own kernel
+          # ignores v1, but a strict KSU-family kernel hosting this app as a
+          # dynamic manager (e.g. BakaSU) rejects any APK carrying
+          # META-INF/MANIFEST.MF ("Unexpected v1 signature scheme found!").
+          zip -d "$APK" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' >/dev/null 2>&1 || true
           "${BT}apksigner" sign \
             --ks key.jks --ks-pass pass:$STOREPASS --key-pass pass:$STOREPASS --ks-key-alias $KEY_ALIAS \
-            --v1-signing-enabled true --v2-signing-enabled true \
+            --v1-signing-enabled false --v2-signing-enabled true \
             --v3-signing-enabled false --v4-signing-enabled false "$APK"
           "${BT}apksigner" verify --verbose --print-certs "$APK" | sed -n '1,12p'
+          if unzip -l "$APK" | grep -q 'META-INF/MANIFEST.MF'; then echo "::error::v1 MANIFEST.MF still present"; exit 1; fi
           VER="${{ needs.meta.outputs.driver_version }}"
           OUT="KernelSU-Next-Samsung_${VER}-${{ needs.meta.outputs.upstream_short }}.apk"
           cp "$APK" "app/build/outputs/apk/release/$OUT"
