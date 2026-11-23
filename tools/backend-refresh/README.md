@@ -25,12 +25,40 @@ If **nothing** moved, the only thing that happens is the *"Last successful
 workflow run"* timestamp in each release's notes is refreshed. If **one** moved,
 only that backend's release is touched; the other is left exactly as it was.
 
+## Near-real-time rebuilds (debounced upstream watcher)
+
+GitHub can't notify this repo about pushes to repositories we don't own, so
+[`.github/workflows/upstream-watch.yml`](../../.github/workflows/upstream-watch.yml)
+polls both upstream branches every 5 minutes (GitHub's minimum — it can run
+later under load). It takes seconds and does nothing when nothing changed.
+
+Debounce rule, per backend:
+
+1. The first time the watcher sees a new upstream HEAD, it records "first seen"
+   in the Actions cache, keyed by that exact commit SHA.
+2. The backend is rebuilt only once that **same** HEAD has stayed unchanged for
+   **10 minutes** (`DEBOUNCE_SECONDS`). A newer commit is a new SHA with a fresh
+   first-seen time, so the timer starts over — a burst of commits yields **one**
+   rebuild, of the final commit, after the burst goes quiet.
+3. The rebuild is a normal *Samsung backend refresh* run dispatched with
+   `only=<settled backends>` and `pin=<exact SHAs>`, so a backend still mid-burst
+   is never built and the build can't drift to a newer commit.
+4. No stacking: nothing is dispatched while a refresh run is queued or running;
+   the next poll re-evaluates afterwards.
+5. Each upstream SHA is dispatched **at most once** by the watcher. If that build
+   fails (e.g. the patch no longer applies), it is not re-queued every poll — the
+   next upstream commit, the daily run, or a manual run retries it.
+
+The daily scheduled refresh stays as a fallback and as the "last successful run"
+heartbeat. Tune the quiet period via `DEBOUNCE_SECONDS` in `upstream-watch.yml`.
+
 ## Files
 
 | File | Role |
 | --- | --- |
 | `targets.json` | Source of truth: upstream repo/branch, patch, keystore, release tag, driver-version formula per backend. |
-| `detect_changes.py` | Compares upstream HEAD vs `state/<id>.json`; emits `*_changed` / `*_sha` outputs. |
+| `detect_changes.py` | Compares upstream HEAD vs `state/<id>.json`; emits `*_changed` / `*_sha` outputs. Accepts `force=`, `only=`, `pin=`. |
+| `watch_decide.py` | The watcher's debounce decision (10-minute quiet period, once-per-SHA dispatch). |
 | `prepare_source.sh` | Clones upstream @ commit, 3-way applies the Samsung patch, swaps the signing cert, prints version/UAPI/cert metadata. Dependency-light (git + openssl); runs inside the DDK container too (`--skip-signing`). |
 | `collect_assets.sh` | Flattens a build's artifacts into clean release assets (APK, `ksud-<triple>`, `*.ko`) + `SHA256SUMS`, excluding logs/mappings. |
 | `update_state.py` | Writes `state/<id>.json` — full rewrite on rebuild, timestamp-only on heartbeat. |

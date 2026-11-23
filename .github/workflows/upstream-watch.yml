@@ -1,0 +1,142 @@
+name: Upstream watch (debounced)
+
+# GitHub cannot notify this repo about pushes to repositories we don't own, so
+# this polls the upstream KernelSU-Next / BakaSU branches every 5 minutes (the
+# Actions minimum; GitHub may run it later than that under load).
+#
+# Debounce: a backend is rebuilt only after its upstream HEAD has stayed the
+# same for DEBOUNCE_SECONDS. Any newer commit is a new HEAD with a fresh
+# "first seen" time, so the timer starts over — a burst of commits produces ONE
+# rebuild, of the final commit, once the burst has been quiet for 10 minutes.
+#
+# The rebuild itself is the normal "Samsung backend refresh" workflow, dispatched
+# with only=<settled backends> and pin=<exact commits> so an unsettled backend is
+# never built mid-burst and the build can't drift to a newer commit.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # dispatch the refresh workflow + read its run status
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  DEBOUNCE_SECONDS: '600'
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read upstream HEADs vs last built
+        id: d
+        run: python3 tools/backend-refresh/detect_changes.py
+
+      # ---- first-seen timestamps (cache keyed by the exact upstream SHA) -----
+      - name: Restore first-seen (KernelSU-Next)
+        id: fs_ksun
+        if: steps.d.outputs.kernelsu_next_changed == 'true'
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .watch/kernelsu-next.firstseen
+          key: firstseen-kernelsu-next-${{ steps.d.outputs.kernelsu_next_sha }}
+      - name: Record first-seen (KernelSU-Next)
+        if: steps.d.outputs.kernelsu_next_changed == 'true' && steps.fs_ksun.outputs.cache-hit != 'true'
+        run: mkdir -p .watch && date +%s > .watch/kernelsu-next.firstseen
+      - name: Save first-seen (KernelSU-Next)
+        if: steps.d.outputs.kernelsu_next_changed == 'true' && steps.fs_ksun.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .watch/kernelsu-next.firstseen
+          key: firstseen-kernelsu-next-${{ steps.d.outputs.kernelsu_next_sha }}
+
+      - name: Restore first-seen (BakaSU)
+        id: fs_baka
+        if: steps.d.outputs.bakasu_changed == 'true'
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .watch/bakasu.firstseen
+          key: firstseen-bakasu-${{ steps.d.outputs.bakasu_sha }}
+      - name: Record first-seen (BakaSU)
+        if: steps.d.outputs.bakasu_changed == 'true' && steps.fs_baka.outputs.cache-hit != 'true'
+        run: mkdir -p .watch && date +%s > .watch/bakasu.firstseen
+      - name: Save first-seen (BakaSU)
+        if: steps.d.outputs.bakasu_changed == 'true' && steps.fs_baka.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .watch/bakasu.firstseen
+          key: firstseen-bakasu-${{ steps.d.outputs.bakasu_sha }}
+
+      # ---- "already dispatched this SHA" markers -----------------------------
+      - name: Restore dispatched marker (KernelSU-Next)
+        if: steps.d.outputs.kernelsu_next_changed == 'true'
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .watch/kernelsu-next.dispatched
+          key: dispatched-kernelsu-next-${{ steps.d.outputs.kernelsu_next_sha }}
+      - name: Restore dispatched marker (BakaSU)
+        if: steps.d.outputs.bakasu_changed == 'true'
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .watch/bakasu.dispatched
+          key: dispatched-bakasu-${{ steps.d.outputs.bakasu_sha }}
+
+      # ---- debounce decision -------------------------------------------------
+      - name: Decide (10-minute quiet period)
+        id: decide
+        env:
+          KERNELSU_NEXT_CHANGED: ${{ steps.d.outputs.kernelsu_next_changed }}
+          KERNELSU_NEXT_SHA:     ${{ steps.d.outputs.kernelsu_next_sha }}
+          BAKASU_CHANGED:        ${{ steps.d.outputs.bakasu_changed }}
+          BAKASU_SHA:            ${{ steps.d.outputs.bakasu_sha }}
+        run: python3 tools/backend-refresh/watch_decide.py kernelsu-next bakasu
+
+      # ---- never stack rebuilds: skip while a refresh is queued/running ------
+      - name: Check for an active refresh run
+        id: busy
+        if: steps.decide.outputs.any_settled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=0
+          for s in queued in_progress waiting requested pending; do
+            c=$(gh api "repos/${{ github.repository }}/actions/workflows/samsung-refresh.yml/runs?status=$s&per_page=1" --jq '.total_count' || echo 0)
+            n=$((n + c))
+          done
+          echo "active refresh runs: $n"
+          echo "busy=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch debounced rebuild
+        id: dispatch
+        if: steps.decide.outputs.any_settled == 'true' && steps.busy.outputs.busy == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY: ${{ steps.decide.outputs.settled }}
+          PIN:  ${{ steps.decide.outputs.pin }}
+        run: |
+          python3 -c 'import json,os; print(json.dumps({"ref":"main","inputs":{"force":"","only":os.environ["ONLY"],"pin":os.environ["PIN"]}}))' \
+            | gh api -X POST "repos/${{ github.repository }}/actions/workflows/samsung-refresh.yml/dispatches" --input -
+          echo "dispatched rebuild: only=$ONLY pin=$PIN"
+          mkdir -p .watch
+          IFS=',' read -ra ids <<< "$ONLY"
+          for id in "${ids[@]}"; do touch ".watch/$id.dispatched"; done
+
+      - name: Mark dispatched (KernelSU-Next)
+        if: steps.dispatch.outcome == 'success' && contains(steps.decide.outputs.settled, 'kernelsu-next')
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .watch/kernelsu-next.dispatched
+          key: dispatched-kernelsu-next-${{ steps.d.outputs.kernelsu_next_sha }}
+      - name: Mark dispatched (BakaSU)
+        if: steps.dispatch.outcome == 'success' && contains(steps.decide.outputs.settled, 'bakasu')
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .watch/bakasu.dispatched
+          key: dispatched-bakasu-${{ steps.d.outputs.bakasu_sha }}

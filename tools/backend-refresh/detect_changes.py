@@ -16,6 +16,10 @@ Writes : GITHUB_OUTPUT lines  (also prints a human summary)
 
 A backend is "changed" when its remote HEAD differs from state, when it has no
 state yet (first build), or when force=<id|all> is passed on the command line.
+
+Optional args (used by the debounced upstream watcher):
+  only=<id>[,<id>]        only these backends may be marked changed
+  pin=<id>=<sha>[,...]    use this exact upstream commit instead of current HEAD
 """
 import json
 import os
@@ -47,20 +51,41 @@ def read_state(backend_id: str) -> str:
         return ""
 
 
+def parse_pins(spec: str) -> dict:
+    """'kernelsu-next=abc123,bakasu=def456' -> {id: sha}"""
+    pins = {}
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        bid, _, sha = part.partition("=")
+        if bid and sha:
+            pins[bid.strip()] = sha.strip()
+    return pins
+
+
 def main() -> int:
-    force = ""
+    force, only, pins = "", None, {}
     for a in sys.argv[1:]:
-        if a.startswith("force="):
-            force = a.split("=", 1)[1].strip()
+        key, _, val = a.partition("=")
+        val = val.strip()
+        if key == "force":
+            force = val
+        elif key == "only" and val:
+            # Restrict rebuilds to these backends (used by the debounced
+            # upstream watcher so an unsettled backend is never built mid-burst).
+            only = {v.strip() for v in val.split(",") if v.strip()}
+        elif key == "pin" and val:
+            # Build exactly this commit instead of whatever HEAD is right now.
+            pins = parse_pins(val)
 
     targets = json.loads(TARGETS.read_text())["backends"]
     out_lines, summary, changed_ids = [], [], []
 
     for bid, cfg in targets.items():
-        remote = ls_remote(cfg["upstream_repo"], cfg["upstream_branch"])
+        remote = pins.get(bid) or ls_remote(cfg["upstream_repo"], cfg["upstream_branch"])
         prev = read_state(bid)
         forced = force in ("all", bid)
         changed = forced or (remote != prev)
+        if only is not None and bid not in only and not forced:
+            changed = False
         if changed:
             changed_ids.append(bid)
         key = bid.replace("-", "_")  # safe for GitHub Actions output references

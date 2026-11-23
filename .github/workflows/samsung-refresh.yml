@@ -16,6 +16,16 @@ on:
         required: false
         default: ''
         type: string
+      only:
+        description: '(watcher) Only these backends may rebuild, e.g. "kernelsu-next" — blank = all'
+        required: false
+        default: ''
+        type: string
+      pin:
+        description: '(watcher) Build exact commits, e.g. "kernelsu-next=<sha>" — blank = current HEAD'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -38,7 +48,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Detect upstream changes
         id: d
-        run: python3 tools/backend-refresh/detect_changes.py "force=${{ inputs.force }}"
+        run: |
+          python3 tools/backend-refresh/detect_changes.py \
+            "force=${{ inputs.force }}" "only=${{ inputs.only }}" "pin=${{ inputs.pin }}"
       - name: Mirror changed upstreams into upstream-* branches
         env:
           GH_TOKEN: ${{ github.token }}

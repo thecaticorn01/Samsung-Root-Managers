@@ -41,6 +41,11 @@ If no upstream changed, the workflow only refreshes the *"Last successful
 workflow run"* timestamp in each release's notes. If only one changed, the other
 release is left untouched.
 
+Between daily runs, the [**Upstream watch**](../../actions/workflows/upstream-watch.yml)
+workflow polls upstream every 5 minutes and triggers a rebuild of a changed
+backend once its upstream has been **quiet for 10 minutes** — each new commit
+resets that timer, so a burst of commits produces a single rebuild.
+
 Full design and maintenance notes: [`tools/backend-refresh/README.md`](tools/backend-refresh/README.md).
 
 ## Why two certificates
@@ -72,6 +77,7 @@ state/                   last-built provenance per backend (drives release notes
 tools/backend-refresh/   detection, source-prep, release scripts + docs
 .github/workflows/
   samsung-refresh.yml        daily orchestrator (detect / mirror / release)
+  upstream-watch.yml         5-minute poller with 10-minute debounce
   build-kernelsu-next.yml    reusable build for KernelSU Next
   build-bakasu.yml           reusable build for BakaSU
 ```
