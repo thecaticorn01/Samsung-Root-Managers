@@ -1452,25 +1452,11 @@ index 6336a222..37f5f255 100644
  }
  
  void __init ksu_app_profile_init(void)
-diff --git a/kernel/susfs/Makefile b/kernel/susfs/Makefile
-index 6e62c0f5..1f2d93de 100644
---- a/kernel/susfs/Makefile
-+++ b/kernel/susfs/Makefile
-@@ -17,9 +17,6 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
-               sus_mount_identity.o sus_mount_idmap.o sus_mount_prefix.o sus_mount_policy.o sus_mount_view.o sus_mount_ns_iter.o \
-               fsnotify_lifetime.o btf_layout.o sus_dirent.o
- 
--susfs_guard_lkm-objs += kallrecon/lib/core.o kallrecon/lib/access.o kallrecon/lib/discover.o \
--              kallrecon/lib/symbol.o kallrecon/lib/slide.o kallrecon/lib/fastboot.o \
--              kallrecon/lib/hint.o kallrecon/lib/variant.o kallrecon/lib/anchor.o
- 
- susfs_guard_lkm-objs += HooKern/hk.o HooKern/hk_ksym.o HooKern/hk_patch.o HooKern/hk_flush.o \
-               HooKern/hk_inline.o
 diff --git a/kernel/susfs/symbol_resolver.c b/kernel/susfs/symbol_resolver.c
-index 9ef64b91..096f76b7 100644
+index 9ef64b91..44c929ef 100644
 --- a/kernel/susfs/symbol_resolver.c
 +++ b/kernel/susfs/symbol_resolver.c
-@@ -1,276 +1,510 @@
+@@ -1,276 +1,517 @@
  /* SPDX-License-Identifier: GPL-2.0 */
 -#include <linux/module.h>
 -#include <linux/kernel.h>
@@ -1776,14 +1762,23 @@ index 9ef64b91..096f76b7 100644
 -	int max;
 -	int n;
 -};
--
--static void kr_collect_add(struct kr_collect *c, unsigned long addr)
 +/* Raw name lookup through the bootstrapped kallsyms_lookup_name(), for names the KERNEL does not
 + * own: its implementation ends in module_kallsyms_lookup_name(), so a symbol provided by
 + * kernelsu.ko is found too - which is why find_kernel_symbol_exact() (module owners refused) is not
 + * the tool for callers that need exactly that.  0 = unknown name, or the resolver is not up; never
 + * sleeps.  __nocfi because the call goes through the resolver's function pointer. */
 +unsigned long __nocfi ksu_kallsyms_lookup_name(const char *name)
++{
++	if (!name || !name[0] || unlikely(!kallsyms_lookup_name_fn))
++		return 0;
+ 
+-static void kr_collect_add(struct kr_collect *c, unsigned long addr)
++	return kallsyms_lookup_name_fn(name);
++}
++
++/* Upstream callers (selinux_hide, priority_uid) resolve kernelsu-module symbols
++ * through this name; with the kprobe-bootstrap resolver it is the same lookup. */
++unsigned long find_kernel_symbol_exact_any(const char *symbol_name)
  {
 -	int i;
 -
@@ -1794,10 +1789,7 @@ index 9ef64b91..096f76b7 100644
 -			return;
 -	if (c->n < c->max)
 -		c->addrs[c->n++] = addr;
-+	if (!name || !name[0] || unlikely(!kallsyms_lookup_name_fn))
-+		return 0;
-+
-+	return kallsyms_lookup_name_fn(name);
++	return ksu_kallsyms_lookup_name(symbol_name);
  }
  
 -int ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
@@ -1830,10 +1822,6 @@ index 9ef64b91..096f76b7 100644
 +
 +    if (kallsyms_on_each_symbol_fn) {
 +        struct ksu_all_names_ctx ctx = { .symbol_name = name, .addrs = addrs, .max = max, .n = 0 };
-+
-+        kallsyms_on_each_symbol_fn(ksu_all_names_cb, &ctx);
-+        n = ctx.n;
-+    }
  
 -	mutex_lock(&ks_linear_lock);
 -	if (safe_read(ti_buf, (void *)klindex_addr, sizeof(ti_buf)) ||
@@ -1871,6 +1859,10 @@ index 9ef64b91..096f76b7 100644
 -out:
 -	mutex_unlock(&ks_linear_lock);
 -	return c.n;
++        kallsyms_on_each_symbol_fn(ksu_all_names_cb, &ctx);
++        n = ctx.n;
++    }
++
 +    if (n == 0) {
 +        /* No walker (pre-5.19) or no match: the single-address lookup is the fallback, and on
 +         * the kernels where a name is ambiguous the walker exists. */
@@ -2007,33 +1999,19 @@ index 9ef64b91..096f76b7 100644
 +
 +    if (!symbol_name || !symbol_name[0])
 +        return NULL;
-+
-+    symbol_len = strlen(symbol_name);
  
 -	memset(&hint, 0, sizeof(hint));
 -	hint.timeout_ms = KR_TIMEOUT_MS;
 -	kallrecon_supply(&hint);
++    symbol_len = strlen(symbol_name);
+ 
+-	find_kallsyms_base();
 +#if !USE_KCFI
 +    char cfi_name[KSYM_NAME_LEN];
 +    snprintf(cfi_name, sizeof(cfi_name), "%s.cfi_jt", symbol_name);
 +    addr = (void *)find_kernel_symbol_exact(cfi_name);
 +    if (addr)
 +        return addr;
- 
--	find_kallsyms_base();
-+    addr = resolve_symbol_variant(symbol_name, symbol_len);
-+    if (addr)
-+        return addr;
-+
-+    return (void *)find_kernel_symbol_exact(symbol_name);
-+#else
-+    addr = (void *)find_kernel_symbol_exact(symbol_name);
-+    if (addr)
-+        return addr;
-+
-+    return resolve_symbol_variant(symbol_name, symbol_len);
-+#endif
-+}
  
 -	if (!kr_layout_ready() || !kallrecon_klp) {
 -		memset(&hint, 0, sizeof(hint));
@@ -2043,6 +2021,26 @@ index 9ef64b91..096f76b7 100644
 -		kallrecon_supply(&hint);
 -		kallrecon_retry();
 -	}
++    addr = resolve_symbol_variant(symbol_name, symbol_len);
++    if (addr)
++        return addr;
+ 
+-	if (!kr_layout_ready() || !kallrecon_klp) {
+-		pr_err("symbol_resolver: kallrecon discovery failed (%d, klp=%d), refusing to load\n",
+-		       kallrecon_fail_reason(), !!kallrecon_klp);
+-		return -ENODATA;
+-	}
++    return (void *)find_kernel_symbol_exact(symbol_name);
++#else
++    addr = (void *)find_kernel_symbol_exact(symbol_name);
++    if (addr)
++        return addr;
+ 
+-	kr_ready = true;
++    return resolve_symbol_variant(symbol_name, symbol_len);
++#endif
++}
++
 +/* Is @addr one of the addresses kallsyms has for @name?
 + *
 + * Asking the question address -> name (ksu_symbol_is_start() below) cannot answer this on its own,
@@ -2086,11 +2084,9 @@ index 9ef64b91..096f76b7 100644
 +    return 0;
 +}
  
--	if (!kr_layout_ready() || !kallrecon_klp) {
--		pr_err("symbol_resolver: kallrecon discovery failed (%d, klp=%d), refusing to load\n",
--		       kallrecon_fail_reason(), !!kallrecon_klp);
--		return -ENODATA;
--	}
+-	kr_lookup_fn = (void *)kr_klp("kallsyms_lookup");
+-	if (!kr_lookup_fn)
+-		pr_warn("symbol_resolver: kallsyms_lookup not resolved, module names unavailable\n");
 +/* Is @addr the FIRST instruction of a core-kernel function called @name - i.e. is it safe to hang a
 + * kprobe on it as that function?  Two tests, because neither is complete on its own:
 + *
@@ -2128,8 +2124,7 @@ index 9ef64b91..096f76b7 100644
 +    /* Not proven by name: ask it the other way round (see ksu_addr_is_named()). */
 +    return ksu_addr_is_named(addr, name);
 +}
- 
--	kr_ready = true;
++
 +/* __nocfi like every other function here that reaches a resolved symbol: the call to
 + * kallsyms_lookup() goes through a function pointer, so an instrumented call site would be
 + * checked against the kernel's type id - and that check panics when it does not match.
@@ -2156,10 +2151,7 @@ index 9ef64b91..096f76b7 100644
 +
 +    return (int)strlen(buf);
 +}
- 
--	kr_lookup_fn = (void *)kr_klp("kallsyms_lookup");
--	if (!kr_lookup_fn)
--		pr_warn("symbol_resolver: kallsyms_lookup not resolved, module names unavailable\n");
++
 +int __init ksu_init_symbol_resolver(void)
 +{
 +    int match_ok = 0;
@@ -2189,14 +2181,16 @@ index 9ef64b91..096f76b7 100644
 +    return kallsyms_lookup_name_fn ? 0 : -ENODATA;
  }
 diff --git a/kernel/susfs/symbol_resolver.h b/kernel/susfs/symbol_resolver.h
-index 9aa78e80..ec34b8ea 100644
+index 9aa78e80..21266ed4 100644
 --- a/kernel/susfs/symbol_resolver.h
 +++ b/kernel/susfs/symbol_resolver.h
-@@ -4,10 +4,23 @@
+@@ -4,10 +4,26 @@
  
  void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name);
  unsigned long find_kernel_symbol_exact(const char *symbol_name);
--unsigned long find_kernel_symbol_exact_any(const char *symbol_name);
++/* Exact name -> address INCLUDING module-owned symbols (e.g. a kernelsu.ko
++ * variable). Same lookup as ksu_kallsyms_lookup_name(); kept for upstream callers. */
+ unsigned long find_kernel_symbol_exact_any(const char *symbol_name);
 +/* EVERY vmlinux symbol with this exact name (not just the first): a kprobe registered with
 + * .symbol_name attaches to whichever match kallsyms lists first, and not every name is unique
 + * (measured: `seq_show` exists four times from 6.1 on, once on 5.10/5.15).  Writes at most
