@@ -4,10 +4,13 @@ name: Upstream watch (debounced)
 # this polls the upstream KernelSU-Next / BakaSU branches every 5 minutes (the
 # Actions minimum; GitHub may run it later than that under load).
 #
-# Debounce: a backend is rebuilt only after its upstream HEAD has stayed the
-# same for DEBOUNCE_SECONDS. Any newer commit is a new HEAD with a fresh
-# "first seen" time, so the timer starts over — a burst of commits produces ONE
-# rebuild, of the final commit, once the burst has been quiet for 10 minutes.
+# Debounce: a backend is rebuilt only once its upstream HEAD commit is at least
+# DEBOUNCE_SECONDS old (measured from the commit's own timestamp). Any newer
+# commit becomes the new HEAD with a newer timestamp, so the timer starts over —
+# a burst of commits produces ONE rebuild, of the final commit, once upstream has
+# been quiet for 10 minutes. Measuring from the commit time (not from when this
+# poller happened to notice it) keeps this correct even though GitHub often runs
+# the 5-minute schedule hours late.
 #
 # The rebuild itself is the normal "Samsung backend refresh" workflow, dispatched
 # with only=<settled backends> and pin=<exact commits> so an unsettled backend is
@@ -15,7 +18,7 @@ name: Upstream watch (debounced)
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '4-59/5 * * * *'   # every 5 min, offset from :00 (GitHub's busiest, most-dropped slots)
   workflow_dispatch:
 
 permissions:

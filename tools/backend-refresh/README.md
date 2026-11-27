@@ -29,17 +29,21 @@ only that backend's release is touched; the other is left exactly as it was.
 
 GitHub can't notify this repo about pushes to repositories we don't own, so
 [`.github/workflows/upstream-watch.yml`](../../.github/workflows/upstream-watch.yml)
-polls both upstream branches every 5 minutes (GitHub's minimum — it can run
-later under load). It takes seconds and does nothing when nothing changed.
+polls both upstream branches every 5 minutes (GitHub's minimum — in practice
+GitHub often runs it far less often, sometimes hours apart). It takes seconds and does nothing when nothing changed.
 
 Debounce rule, per backend:
 
-1. The first time the watcher sees a new upstream HEAD, it records "first seen"
-   in the Actions cache, keyed by that exact commit SHA.
-2. The backend is rebuilt only once that **same** HEAD has stayed unchanged for
-   **10 minutes** (`DEBOUNCE_SECONDS`). A newer commit is a new SHA with a fresh
-   first-seen time, so the timer starts over — a burst of commits yields **one**
-   rebuild, of the final commit, after the burst goes quiet.
+1. The quiet-period clock starts at the upstream HEAD commit's own timestamp.
+2. The backend is rebuilt only once that HEAD commit is at least **10 minutes**
+   old (`DEBOUNCE_SECONDS`). A newer commit becomes the new HEAD with a newer
+   timestamp, so the timer starts over — a burst of commits yields **one**
+   rebuild, of the final commit, after the burst goes quiet. Because the clock is
+   the commit time (not when the watcher noticed it), this stays correct even
+   when GitHub runs the 5-minute schedule hours late, which it often does: the
+   first poll after upstream has been quiet for 10 minutes rebuilds. (If the
+   commit time can't be fetched, it falls back to when the watcher first saw the
+   SHA, kept in the Actions cache.)
 3. The rebuild is a normal *Samsung backend refresh* run dispatched with
    `only=<settled backends>` and `pin=<exact SHAs>`, so a backend still mid-burst
    is never built and the build can't drift to a newer commit.
