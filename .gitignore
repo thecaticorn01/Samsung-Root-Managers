@@ -10,3 +10,5 @@ assets.txt
 # transient cert exports
 keystores/*.der
 **/.signing/
+__pycache__/
+*.pyc
